@@ -146,7 +146,7 @@ function searchInventory(productName) {
   const stmt = db.prepare(
     `SELECT product_name, brand, price, stock
      FROM inventory
-     WHERE LOWER(product_name) = LOWER(?)
+     WHERE LOWER(?) LIKE '%' || LOWER(product_name) || '%'
      ORDER BY price ASC`,
   );
 
