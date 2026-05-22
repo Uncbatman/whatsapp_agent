@@ -16,6 +16,39 @@ function getGeminiClient() {
   const currentKey = apiKeys[currentKeyIndex];
   return new GoogleGenAI({ apiKey: currentKey });
 }
+
+async function processWhatsAppOrder(incomingMessage) {
+  let retries = apiKeys.length;
+
+  while (retries > 0) {
+    try {
+      console.log(`🧠 Querying Key Index [${currentKeyIndex}]...`);
+      const ai = getGeminiClient();
+
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: incomingMessage,
+      });
+
+      return response.text; // 🎉 Success! Return parsed data
+    } catch (error) {
+      const status = error.status || (error.response && error.response.status);
+      console.warn(
+        `❌ Key Index [${currentKeyIndex}] failed (Status: ${status || "Error"}). Trying next key...`,
+      );
+
+      // Move pointer globally to the next key
+      currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
+      retries--;
+
+      // Short breath to prevent slamming the next key
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+
+  // This ONLY fires if it loops through all available keys and EVERY SINGLE ONE fails
+  throw new Error("All Gemini API keys are fully exhausted for the day.");
+}
 // =================================
 
 const express = require("express");
@@ -402,43 +435,7 @@ app.post("/webhook", async (req, res) => {
 
     const fullSystemPrompt = `INSTRUCTIONS:\n${shopRules}\n\n${chatHistoryContext}NEW CUSTOMER MESSAGE: "${customerMessage}"`;
 
-    let botResponse = null;
-    let retries = apiKeys.length;
-
-    while (retries > 0) {
-      try {
-        const ai = getGeminiClient();
-        console.log(
-          `🧠 Attempting AI parse with Key Index [${currentKeyIndex}]...`,
-        );
-
-        const response = await ai.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: fullSystemPrompt,
-        });
-
-        botResponse = response.text; // Success!
-      } catch (error) {
-        const status =
-          error.status || (error.response && error.response.status);
-
-        // 🔄 Rotate keys for ANY error status (429, 503, 403, etc.) to keep production alive
-        console.warn(
-          `❌ Key Index [${currentKeyIndex}] failed (Status: ${status || "Error"}). Trying next key...`,
-        );
-
-        // Safely increment to the next key index slot
-        currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
-        retries--;
-
-        // Brief pause before trying the next key index
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
-    }
-
-    if (!botResponse) {
-      throw new Error("All Gemini API keys are fully exhausted for the day.");
-    }
+    let botResponse = await processWhatsAppOrder(fullSystemPrompt);
 
     console.log(`🤖 Gemini responded beautifully!`);
 
