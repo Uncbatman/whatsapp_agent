@@ -3,10 +3,10 @@ const { GoogleGenAI } = require("@google/genai");
 // === API Key Rotation Framework ===
 // Force the app to read the keys, and use a hardcoded string fallback if the .env slips up
 const apiKeys = [
-  process.env.GEMINI_API_KEY_1 || "AIzaSyDORFcnqxaA_Lk7nhzFLiIhhDemQHtNTws", // paste your actual key 1 string here if .env fails
-  process.env.GEMINI_API_KEY_2 || "AIzaSyAJkgFoCCgupE1T8BD60JFNPXIHGjWbLU", // paste your actual key 2 string here if .env fails
-  process.env.GEMINI_API_KEY_3 || "AIzaSyCWI6nebYEa5-viPaIwmcmAg9Wm5YNjNg8", // Paste your brand new 3rd key string directly here!
-].filter(Boolean); // This cleans out any empty slots automatically
+  process.env.GEMINI_API_KEY_1,
+  process.env.GEMINI_API_KEY_2,
+  process.env.GEMINI_API_KEY_3,
+].filter(Boolean);
 
 console.log("🔑 Loaded Keys Count:", apiKeys.filter(Boolean).length);
 
