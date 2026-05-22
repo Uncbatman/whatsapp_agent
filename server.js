@@ -419,23 +419,31 @@ app.post("/webhook", async (req, res) => {
 
         botResponse = response.text; // Success!
       } catch (error) {
+        const status =
+          error.status || (error.response && error.response.status);
+        const errMsg = error.message ? error.message.toLowerCase() : "";
+
+        // 🔄 Check if it's a Quota limit (429) OR a temporary Server Overload (503)
         if (
-          error.status === 429 ||
-          (error.message && error.message.includes("429"))
+          status === 429 ||
+          status === 503 ||
+          errMsg.includes("429") ||
+          errMsg.includes("503") ||
+          errMsg.includes("unavailable")
         ) {
-          // 🔴 THIS LOG IS OUR UNMASKING TOOL:
           console.warn(
-            `❌ Key Index [${currentKeyIndex}] failed with a 429 Quota Error.`,
+            `❌ Key Index [${currentKeyIndex}] hit a temporary network block (${status || "503"}). Rotating keys...`,
           );
 
-          // Move to the next key in the array safely
+          // Move to the next key in your 3-key array safely
           currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
           retries--;
 
-          // Give it a 1.5-second pause so it doesn't slam the next key instantly
+          // Pause for 1.5 seconds to let Google's servers breathe before hitting the next key
           await new Promise((resolve) => setTimeout(resolve, 1500));
         } else {
-          throw error; // Throw immediately if it's a structural syntax error
+          // If it's a real syntax error, crash immediately so you can fix it
+          throw error;
         }
       }
     }
