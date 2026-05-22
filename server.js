@@ -421,30 +421,18 @@ app.post("/webhook", async (req, res) => {
       } catch (error) {
         const status =
           error.status || (error.response && error.response.status);
-        const errMsg = error.message ? error.message.toLowerCase() : "";
 
-        // 🔄 Check if it's a Quota limit (429) OR a temporary Server Overload (503)
-        if (
-          status === 429 ||
-          status === 503 ||
-          errMsg.includes("429") ||
-          errMsg.includes("503") ||
-          errMsg.includes("unavailable")
-        ) {
-          console.warn(
-            `❌ Key Index [${currentKeyIndex}] hit a temporary network block (${status || "503"}). Rotating keys...`,
-          );
+        // 🔄 Rotate keys for ANY error status (429, 503, 403, etc.) to keep production alive
+        console.warn(
+          `❌ Key Index [${currentKeyIndex}] failed (Status: ${status || "Error"}). Trying next key...`,
+        );
 
-          // Move to the next key in your 3-key array safely
-          currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
-          retries--;
+        // Safely increment to the next key index slot
+        currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
+        retries--;
 
-          // Pause for 1.5 seconds to let Google's servers breathe before hitting the next key
-          await new Promise((resolve) => setTimeout(resolve, 1500));
-        } else {
-          // If it's a real syntax error, crash immediately so you can fix it
-          throw error;
-        }
+        // Brief pause before trying the next key index
+        await new Promise((resolve) => setTimeout(resolve, 1500));
       }
     }
 
