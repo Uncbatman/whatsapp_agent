@@ -1,25 +1,17 @@
-const initSqlJs = require("sql.js");
+const Database = require("better-sqlite3");
 const fs = require("fs");
 const path = require("path");
 
 const DB_PATH = path.join(__dirname, "chatbot.db");
 
-async function seedDatabase() {
-  const SQL = await initSqlJs();
-
-  // Load existing database or create new one
-  let db;
-  if (fs.existsSync(DB_PATH)) {
-    const buffer = fs.readFileSync(DB_PATH);
-    db = new SQL.Database(buffer);
-    console.log("📁 Database loaded from: chatbot.db");
-  } else {
-    db = new SQL.Database();
-    console.log("📁 Database created: chatbot.db");
-  }
+function seedDatabase() {
+  // Create or open database
+  const db = new Database(DB_PATH);
+  db.pragma("journal_mode = WAL");
+  console.log("✅ Database initialized with WAL mode");
 
   // Create tables
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       customer_phone TEXT NOT NULL,
@@ -44,8 +36,8 @@ async function seedDatabase() {
   console.log("✅ Tables and indexes created");
 
   // Seed inventory
-  const count = db.exec("SELECT COUNT(*) as count FROM inventory");
-  const rowCount = count.length > 0 ? count[0].values[0][0] : 0;
+  const count = db.prepare("SELECT COUNT(*) as count FROM inventory").get();
+  const rowCount = count?.count || 0;
 
   if (rowCount === 0) {
     const products = [
@@ -65,21 +57,13 @@ async function seedDatabase() {
     );
 
     products.forEach((p) => {
-      stmt.run([p.product_name, p.brand, p.price]);
+      stmt.run(p.product_name, p.brand, p.price);
     });
-
-    stmt.free();
 
     console.log("✅ Inventory seeded with 9 products");
   } else {
     console.log(`✅ Inventory already exists (${rowCount} items)`);
   }
-
-  // Save database to disk
-  const data = db.export();
-  const buffer = Buffer.from(data);
-  fs.writeFileSync(DB_PATH, buffer);
-  console.log("💾 Database saved to chatbot.db");
 
   db.close();
   console.log("🎉 Seeding complete!");

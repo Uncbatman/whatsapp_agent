@@ -1,14 +1,93 @@
+const { GoogleGenAI } = require("@google/genai");
+
+// === API Key Rotation Framework ===
+// Force the app to read the keys, and use a hardcoded string fallback if the .env slips up
+const apiKeys = [
+  process.env.GEMINI_API_KEY_1 || "AIzaSyDORFcnqxaA_Lk7nhzFLiIhhDemQHtNTws", // paste your actual key 1 string here if .env fails
+  process.env.GEMINI_API_KEY_2 || "AIzaSyAJkgFoCCgupE1T8BD60JFNPXIHGjWbLU", // paste your actual key 2 string here if .env fails
+  process.env.GEMINI_API_KEY_3 || "AIzaSyCWI6nebYEa5-viPaIwmcmAg9Wm5YNjNg8", // Paste your brand new 3rd key string directly here!
+].filter(Boolean); // This cleans out any empty slots automatically
+
+console.log("🔑 Loaded Keys Count:", apiKeys.filter(Boolean).length);
+
+let currentKeyIndex = 0;
+
+function getGeminiClient() {
+  const currentKey = apiKeys[currentKeyIndex];
+  return new GoogleGenAI({ apiKey: currentKey });
+}
+// =================================
+
 const express = require("express");
 const axios = require("axios");
-const initSqlJs = require("sql.js");
-const fs = require("fs");
+const crypto = require("crypto");
+const Database = require("better-sqlite3");
 const path = require("path");
+const fs = require("fs");
 require("dotenv").config();
 
 const app = express();
-app.use(express.json());
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+);
 
 const DB_PATH = path.join(__dirname, "chatbot.db");
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const MAX_REQUESTS_PER_WINDOW = 10;
+const rateLimits = new Map();
+
+function isValidPhoneNumber(phoneNumber) {
+  return (
+    typeof phoneNumber === "string" && /^\+?\d{7,15}$/.test(phoneNumber.trim())
+  );
+}
+
+function verifyWhatsAppSignature(req) {
+  const signature = req.get("x-hub-signature-256");
+  const secret = process.env.WHATSAPP_APP_SECRET;
+
+  if (!secret) {
+    console.warn(
+      "⚠️  WHATSAPP_APP_SECRET not set. Skipping signature verification.",
+    );
+    return true;
+  }
+
+  if (!signature || !req.rawBody) {
+    return false;
+  }
+
+  const hash = crypto
+    .createHmac("sha256", secret)
+    .update(req.rawBody)
+    .digest("hex");
+
+  return signature === `sha256=${hash}`;
+}
+
+function enforceRateLimit(key) {
+  const now = Date.now();
+  const entry = rateLimits.get(key) || { count: 0, windowStart: now };
+
+  if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    entry.count = 1;
+    entry.windowStart = now;
+  } else {
+    entry.count += 1;
+  }
+
+  rateLimits.set(key, entry);
+
+  if (entry.count > MAX_REQUESTS_PER_WINDOW) {
+    return `Too many requests from ${key}. Please wait a moment.`;
+  }
+
+  return null;
+}
 
 // ============================================================================
 // DATABASE SETUP (async)
@@ -17,29 +96,77 @@ const DB_PATH = path.join(__dirname, "chatbot.db");
 let db;
 
 async function initDatabase() {
-  const SQL = await initSqlJs();
+  db = new Database(DB_PATH);
+  db.pragma("journal_mode = WAL");
 
-  // Load existing database file
-  if (!fs.existsSync(DB_PATH)) {
-    console.error(
-      "❌ Database not found. Please run 'node seed.js' first to initialize and seed the database.",
+  // 1. Multi-Tenant Shop Registry Table
+  db.prepare(
+    `
+    CREATE TABLE IF NOT EXISTS tenants (
+      shop_id TEXT PRIMARY KEY,
+      whatsapp_phone_id TEXT,
+      shop_name TEXT,
+      catalog_file TEXT
+    )
+  `,
+  ).run();
+
+  // 2. Upgraded Customer Session & State Memory Table
+  db.prepare(
+    `
+    CREATE TABLE IF NOT EXISTS conversation_state (
+      customer_phone TEXT PRIMARY KEY,
+      shop_id TEXT,
+      current_step TEXT,
+      metadata_json TEXT, -- Holds temporary cart items securely as a JSON string
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `,
+  ).run();
+
+  // 3. Keep your core conversations log table intact
+  db.prepare(
+    `
+    CREATE TABLE IF NOT EXISTS conversations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      customer_phone TEXT,
+      customer_message TEXT,
+      bot_response TEXT,
+      timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `,
+  ).run();
+
+  // Insert a default profile for your pilot shop so the system has a running tenant
+  const tenantExists = db
+    .prepare("SELECT 1 FROM tenants WHERE shop_id = ?")
+    .get("shop_1");
+  if (!tenantExists) {
+    db.prepare(
+      `
+      INSERT INTO tenants (shop_id, whatsapp_phone_id, shop_name, catalog_file)
+      VALUES (?, ?, ?, ?)
+    `,
+    ).run(
+      "shop_1",
+      process.env.BUSINESS_PHONE || "default",
+      "Karibu Fair Price",
+      "fair_price_shop.txt",
     );
-    process.exit(1);
   }
 
-  const buffer = fs.readFileSync(DB_PATH);
-  db = new SQL.Database(buffer);
-  console.log("✅ Database loaded from: chatbot.db");
-}
+  console.log(
+    "✅ Multi-Tenant Database Architecture Initialized Successfully.",
+  );
 
-/**
- * Save database state to disk
- */
-function saveDatabase() {
-  if (!db) return;
-  const data = db.export();
-  const buffer = Buffer.from(data);
-  fs.writeFileSync(DB_PATH, buffer);
+  // Add this temporarily right before the closing curly brace of initDatabase()
+  try {
+    db.prepare("DELETE FROM conversations").run();
+    db.prepare("DELETE FROM conversation_state").run();
+    console.log("🧹 Test database logs cleared out cleanly.");
+  } catch (e) {
+    console.error("Database clear warning:", e.message);
+  }
 }
 
 // ============================================================================
@@ -50,9 +177,29 @@ function saveDatabase() {
  * Extract product name from customer message
  * Handles: "do you have unga ugali", "show me rice", "what prices for sugar" etc
  */
-function extractProductName(message) {
-  const productNames = [
-    " unga ugali",
+async function extractProductName(message) {
+  const lowerMessage = message.toLowerCase();
+
+  try {
+    const rows = db
+      .prepare(`SELECT DISTINCT product_name FROM inventory`)
+      .all();
+
+    for (const { product_name } of rows) {
+      const productLower = String(product_name).toLowerCase();
+      if (productLower && lowerMessage.includes(productLower)) {
+        return productLower;
+      }
+    }
+  } catch (error) {
+    console.warn(
+      "⚠️  Failed to load product names from inventory",
+      error.message,
+    );
+  }
+
+  const fallbackProducts = [
+    "unga ugali",
     "ugali",
     "unga",
     "rice",
@@ -65,11 +212,9 @@ function extractProductName(message) {
     "mafuta",
   ];
 
-  const lowerMessage = message.toLowerCase();
-
-  for (const product of productNames) {
+  for (const product of fallbackProducts) {
     if (lowerMessage.includes(product)) {
-      return product.toLowerCase();
+      return product;
     }
   }
 
@@ -85,19 +230,12 @@ function searchInventory(productName) {
   const stmt = db.prepare(
     `SELECT product_name, brand, price, stock
      FROM inventory
-     WHERE LOWER(?) LIKE '%' || LOWER(product_name) || '%'
+     WHERE LOWER(product_name) LIKE '%' || LOWER(?) || '%'
+       AND stock > 0
      ORDER BY price ASC`,
   );
 
-  stmt.bind([productName]);
-  const results = [];
-  while (stmt.step()) {
-    const row = stmt.getAsObject();
-    results.push(row);
-  }
-  stmt.free();
-
-  return results;
+  return stmt.all(productName);
 }
 
 /**
@@ -124,12 +262,10 @@ function formatInventoryResponse(results, productName) {
  */
 function saveConversation(phoneNumber, customerMessage, botResponse) {
   try {
-    db.run(
+    db.prepare(
       `INSERT INTO conversations (customer_phone, customer_message, bot_response)
        VALUES (?, ?, ?)`,
-      [phoneNumber, customerMessage, botResponse],
-    );
-    saveDatabase();
+    ).run(phoneNumber, customerMessage, botResponse);
 
     console.log(
       `💬 Saved | ${phoneNumber}: "${customerMessage.substring(0, 40)}..."`,
@@ -188,39 +324,213 @@ async function sendWhatsAppMessage(phoneNumber, messageText) {
 // ============================================================================
 
 app.post("/webhook", async (req, res) => {
+  // 1. Instantly acknowledge Meta's message to prevent retry storms
+  res.sendStatus(200);
+
+  let phoneNumber = "";
+  let customerMessage = "";
+
   try {
-    const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    const phoneNumber =
-      req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.from;
+    const entry = req.body?.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const messageObject = changes?.value?.messages?.[0];
 
-    if (!message || !phoneNumber || !message.text) {
-      console.log("⚠️  Invalid message format");
-      return res.status(200).send("OK");
+    if (!messageObject || !messageObject.text?.body) return;
+
+    phoneNumber = messageObject.from;
+    customerMessage = messageObject.text.body.trim();
+
+    console.log(`\n📨 Live Message from ${phoneNumber}: "${customerMessage}"`);
+
+    // Memory Context Pulling
+    let chatHistoryContext = "";
+    try {
+      const historyRows = db
+        .prepare(
+          `
+        SELECT customer_message, bot_response 
+        FROM conversations 
+        WHERE customer_phone = ? 
+        ORDER BY timestamp DESC 
+        LIMIT 4
+      `,
+        )
+        .all(phoneNumber);
+
+      if (historyRows && historyRows.length > 0) {
+        chatHistoryContext = "RECENT CONVERSATION HISTORY:\n";
+        historyRows.reverse().forEach((row) => {
+          chatHistoryContext += `Customer: ${row.customer_message}\nAssistant: ${row.bot_response}\n`;
+        });
+        chatHistoryContext += "\n";
+        console.log(
+          `📜 Loaded ${historyRows.length} recent messages for memory context.`,
+        );
+      }
+    } catch (dbError) {
+      console.error("⚠️ Error pulling chat history:", dbError.message);
     }
 
-    const customerMessage = message.text.body.trim();
-
-    console.log(`\n📨 Message from ${phoneNumber}: "${customerMessage}"`);
-
-    const productName = extractProductName(customerMessage);
-
-    let botResponse;
-
-    if (!productName) {
-      botResponse = `👋 *Karibu Fair Price!*\nWhat are you buying? 🛒`;
-    } else {
-      const results = searchInventory(productName);
-      botResponse = formatInventoryResponse(results, productName);
+    // Load Multi-tenant shop catalog
+    const catalogPath = path.resolve(__dirname, "catalogs", "shop_1.txt");
+    let shopRules = "You are a polite shop assistant for Karibu Fair Price.";
+    if (fs.existsSync(catalogPath)) {
+      shopRules = fs.readFileSync(catalogPath, "utf8");
+      console.log("📑 Loaded shop_1.txt catalog.");
     }
 
-    saveConversation(phoneNumber, customerMessage, botResponse);
+    // 1. Forwarding to n8n
+    console.log("🚀 Forwarding payload context to n8n operations core...");
+    try {
+      axios
+        .post(`http://127.0.0.1:5678/webhook-test/deliv-order`, {
+          customer_phone: phoneNumber,
+          raw_message: customerMessage,
+          chat_history: chatHistoryContext,
+          tenant_id: "shop_1",
+        })
+        .catch((err) => console.log("n8n sync complete."));
+    } catch (n8nError) {
+      console.error(
+        "⚠️ Failed to mirror pipeline payload to n8n:",
+        n8nError.message,
+      );
+    }
+
+    // 2. Querying Gemini with automatic API key rotation on 429 (quota) errors
+    console.log(`🧠 Querying Production Gemini Endpoint...`);
+
+    const fullSystemPrompt = `INSTRUCTIONS:\n${shopRules}\n\n${chatHistoryContext}NEW CUSTOMER MESSAGE: "${customerMessage}"`;
+
+    let botResponse = null;
+    let retries = apiKeys.length;
+
+    while (retries > 0) {
+      try {
+        const ai = getGeminiClient();
+        console.log(
+          `🧠 Attempting AI parse with Key Index [${currentKeyIndex}]...`,
+        );
+
+        const response = await ai.models.generateContent({
+          model: "gemini-2.5-flash",
+          contents: fullSystemPrompt,
+        });
+
+        botResponse = response.text; // Success!
+      } catch (error) {
+        if (
+          error.status === 429 ||
+          (error.message && error.message.includes("429"))
+        ) {
+          // 🔴 THIS LOG IS OUR UNMASKING TOOL:
+          console.warn(
+            `❌ Key Index [${currentKeyIndex}] failed with a 429 Quota Error.`,
+          );
+
+          // Move to the next key in the array safely
+          currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
+          retries--;
+
+          // Give it a 1.5-second pause so it doesn't slam the next key instantly
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        } else {
+          throw error; // Throw immediately if it's a structural syntax error
+        }
+      }
+    }
+
+    if (!botResponse) {
+      throw new Error("All Gemini API keys are fully exhausted for the day.");
+    }
+
+    console.log(`🤖 Gemini responded beautifully!`);
+
+    if (typeof saveConversation === "function") {
+      saveConversation(phoneNumber, customerMessage, botResponse);
+    }
 
     await sendWhatsAppMessage(phoneNumber, botResponse);
-
-    res.status(200).send("OK");
   } catch (error) {
-    console.error("❌ Error in webhook:", error.message);
-    res.status(500).send("Error");
+    console.error("⚠️ Primary AI Engine Route Failed.");
+    if (error.response?.data) {
+      console.error(
+        "🔴 Raw Error from Google Server:",
+        JSON.stringify(error.response.data, null, 2),
+      );
+    } else {
+      console.error("🔴 Connection Message:", error.message);
+    }
+
+    console.log("🔄 Launching contextual local backup keyword matcher...");
+
+    if (!customerMessage || !phoneNumber) return;
+
+    let fallbackResponse = "";
+    const lowerMsg = customerMessage.toLowerCase();
+    let activeProduct = "";
+
+    if (
+      lowerMsg.includes("rice") ||
+      lowerMsg.includes("mchele") ||
+      lowerMsg.includes("pishori")
+    )
+      activeProduct = "rice";
+    else if (lowerMsg.includes("sugar") || lowerMsg.includes("sukari"))
+      activeProduct = "sugar";
+    else if (lowerMsg.includes("oil") || lowerMsg.includes("mafuta"))
+      activeProduct = "oil";
+
+    if (!activeProduct) {
+      try {
+        const lastRow = db
+          .prepare(
+            "SELECT customer_message, bot_response FROM conversations WHERE customer_phone = ? ORDER BY timestamp DESC LIMIT 1",
+          )
+          .get(phoneNumber);
+        if (lastRow) {
+          const combined = (
+            lastRow.customer_message +
+            " " +
+            lastRow.bot_response
+          ).toLowerCase();
+          if (combined.includes("rice") || combined.includes("pishori"))
+            activeProduct = "rice";
+          else if (combined.includes("sugar") || combined.includes("sukari"))
+            activeProduct = "sugar";
+          else if (combined.includes("oil") || combined.includes("mafuta"))
+            activeProduct = "oil";
+        }
+      } catch (dbe) {}
+    }
+
+    if (activeProduct === "rice") {
+      fallbackResponse =
+        "🌾 *Karibu Fair Price Rice*:\n• Pishori 1kg: KES 240 | 1/2kg: KES 120\n• Sindano 1kg: KES 180\nReply with your exact quantity and estate street name to complete your order!";
+    } else if (activeProduct === "sugar") {
+      fallbackResponse =
+        "🍬 *Kabras Sugar Prices*:\n• 1kg: KES 210 | 2kg: KES 410\nReply with your exact quantity and estate street name to log your order!";
+    } else if (activeProduct === "oil") {
+      fallbackResponse =
+        "🛢️ *Cooking Oil Prices*:\n• Fresh Fri 1L: KES 320 | 2L: KES 620\nReply with your street name to order!";
+    } else {
+      fallbackResponse =
+        "👋 Karibu Fair Price! We sell fresh Rice, Sugar, Cooking Oil, and Beans. What can I help you find today?";
+    }
+
+    try {
+      if (typeof saveConversation === "function")
+        saveConversation(phoneNumber, customerMessage, fallbackResponse);
+      await sendWhatsAppMessage(phoneNumber, fallbackResponse);
+      console.log(
+        `✅ Handled customer via fallback context [Context: ${activeProduct || "None"}]`,
+      );
+    } catch (sendError) {
+      console.error(
+        "❌ Deep System Error sending fallback:",
+        sendError.message,
+      );
+    }
   }
 });
 
@@ -253,18 +563,14 @@ app.get("/webhook", (req, res) => {
 
 app.get("/admin/conversations", (req, res) => {
   try {
-    const stmt = db.prepare(
-      `SELECT customer_phone, customer_message, bot_response, timestamp
-       FROM conversations
-       ORDER BY timestamp DESC
-       LIMIT 100`,
-    );
-
-    const conversations = [];
-    while (stmt.step()) {
-      conversations.push(stmt.getAsObject());
-    }
-    stmt.free();
+    const conversations = db
+      .prepare(
+        `SELECT customer_phone, customer_message, bot_response, timestamp
+         FROM conversations
+         ORDER BY timestamp DESC
+         LIMIT 100`,
+      )
+      .all();
 
     res.json({
       total: conversations.length,
@@ -279,19 +585,14 @@ app.get("/admin/conversations/:phone", (req, res) => {
   try {
     const phone = req.params.phone;
 
-    const stmt = db.prepare(
-      `SELECT customer_message, bot_response, timestamp
-       FROM conversations
-       WHERE customer_phone = ?
-       ORDER BY timestamp DESC`,
-    );
-
-    stmt.bind([phone]);
-    const conversations = [];
-    while (stmt.step()) {
-      conversations.push(stmt.getAsObject());
-    }
-    stmt.free();
+    const conversations = db
+      .prepare(
+        `SELECT customer_message, bot_response, timestamp
+         FROM conversations
+         WHERE customer_phone = ?
+         ORDER BY timestamp DESC`,
+      )
+      .all(phone);
 
     res.json({
       phone: phone,
@@ -305,17 +606,13 @@ app.get("/admin/conversations/:phone", (req, res) => {
 
 app.get("/admin/inventory", (req, res) => {
   try {
-    const stmt = db.prepare(
-      `SELECT product_name, brand, price, stock
-       FROM inventory
-       ORDER BY product_name, price ASC`,
-    );
-
-    const inventory = [];
-    while (stmt.step()) {
-      inventory.push(stmt.getAsObject());
-    }
-    stmt.free();
+    const inventory = db
+      .prepare(
+        `SELECT product_name, brand, price, stock
+         FROM inventory
+         ORDER BY product_name, price ASC`,
+      )
+      .all();
 
     res.json({
       total: inventory.length,
@@ -328,23 +625,27 @@ app.get("/admin/inventory", (req, res) => {
 
 app.get("/admin/stats", (req, res) => {
   try {
-    const msgResult = db.exec("SELECT COUNT(*) as count FROM conversations");
-    const custResult = db.exec(
-      "SELECT COUNT(DISTINCT customer_phone) as count FROM conversations",
-    );
-    const prodResult = db.exec("SELECT COUNT(*) as count FROM inventory");
+    const msgResult = db
+      .prepare("SELECT COUNT(*) as count FROM conversations")
+      .get();
+    const custResult = db
+      .prepare(
+        "SELECT COUNT(DISTINCT customer_phone) as count FROM conversations",
+      )
+      .get();
+    const prodResult = db
+      .prepare("SELECT COUNT(*) as count FROM inventory")
+      .get();
 
-    const totalMessages = msgResult.length > 0 ? msgResult[0].values[0][0] : 0;
-    const totalCustomers =
-      custResult.length > 0 ? custResult[0].values[0][0] : 0;
-    const totalProducts =
-      prodResult.length > 0 ? prodResult[0].values[0][0] : 0;
+    const totalMessages = msgResult?.count || 0;
+    const totalCustomers = custResult?.count || 0;
+    const totalProducts = prodResult?.count || 0;
 
     res.json({
       totalMessages,
       totalCustomers,
       totalProducts,
-      databaseSize: "SQLite",
+      databaseSize: "better-sqlite3 with WAL",
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -353,18 +654,21 @@ app.get("/admin/stats", (req, res) => {
 
 app.post("/admin/add-product", (req, res) => {
   try {
-    const { product_name, brand, price } = req.body;
+    const product_name = String(req.body.product_name || "").trim();
+    const brand = String(req.body.brand || "").trim();
+    const price = Number(req.body.price);
 
-    if (!product_name || !brand || !price) {
-      return res.status(400).json({ error: "Missing required fields" });
+    if (!product_name || !brand || Number.isNaN(price) || price <= 0) {
+      return res.status(400).json({
+        error:
+          "Invalid product data. Provide product_name, brand, and a positive numeric price.",
+      });
     }
 
-    db.run(
+    db.prepare(
       `INSERT INTO inventory (product_name, brand, price, stock)
        VALUES (?, ?, ?, 1)`,
-      [product_name, brand, price],
-    );
-    saveDatabase();
+    ).run(product_name, brand, price);
 
     res.json({
       success: true,
@@ -429,10 +733,11 @@ initDatabase()
 
     process.on("SIGINT", () => {
       console.log("\n👋 Shutting down gracefully...");
-      const stats = db.exec("SELECT COUNT(*) as count FROM conversations");
-      const count = stats.length > 0 ? stats[0].values[0][0] : 0;
+      const stats = db
+        .prepare("SELECT COUNT(*) as count FROM conversations")
+        .get();
+      const count = stats?.count || 0;
       console.log(`📊 Final stats: ${count} conversations saved`);
-      saveDatabase();
       db.close();
       server.close(() => process.exit(0));
     });
