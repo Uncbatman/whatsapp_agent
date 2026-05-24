@@ -1,55 +1,57 @@
 const { GoogleGenAI } = require("@google/genai");
+require("dotenv").config();
 
-// === API Key Rotation Framework ===
-// Force the app to read the keys, and use a hardcoded string fallback if the .env slips up
+// 1. Properly initialize your array from the environment variables
 const apiKeys = [
   process.env.GEMINI_API_KEY_1,
   process.env.GEMINI_API_KEY_2,
   process.env.GEMINI_API_KEY_3,
-].filter(Boolean);
-
-console.log("🔑 Loaded Keys Count:", apiKeys.filter(Boolean).length);
+].filter(Boolean); // This automatically strips out any undefined or empty slots
 
 let currentKeyIndex = 0;
 
-function getGeminiClient() {
-  const currentKey = apiKeys[currentKeyIndex];
-  return new GoogleGenAI({ apiKey: currentKey });
-}
-
 async function processWhatsAppOrder(incomingMessage) {
+  // 🛡️ Safety check: If the array is literally empty, jump out safely
+  if (apiKeys.length === 0) {
+    throw new Error("No API keys found in your environment configuration.");
+  }
+
   let retries = apiKeys.length;
 
   while (retries > 0) {
     try {
-      console.log(`🧠 Querying Key Index [${currentKeyIndex}]...`);
-      const ai = getGeminiClient();
+      // 🟢 THIS LOG MUST SHOW UP NOW
+      console.log(
+        `🧠 Attempting AI parse with Key Index [${currentKeyIndex}]...`,
+      );
+
+      const currentKey = apiKeys[currentKeyIndex];
+      const ai = new GoogleGenAI({ apiKey: currentKey });
 
       const response = await ai.models.generateContent({
         model: "gemini-2.5-flash",
         contents: incomingMessage,
       });
 
-      return response.text; // 🎉 Success! Return parsed data
+      return response.text; // Success!
     } catch (error) {
       const status = error.status || (error.response && error.response.status);
       console.warn(
-        `❌ Key Index [${currentKeyIndex}] failed (Status: ${status || "Error"}). Trying next key...`,
+        `❌ Key Index [${currentKeyIndex}] failed (Status: ${status || "Error"}). Rotating keys...`,
       );
 
-      // Move pointer globally to the next key
+      // Move index pointer to the next slot safely
       currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
       retries--;
 
-      // Short breath to prevent slamming the next key
+      // Give it a 1-second pause to breathe before retrying
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
 
-  // This ONLY fires if it loops through all available keys and EVERY SINGLE ONE fails
+  // This line ONLY fires if it runs out of retries across ALL active keys
   throw new Error("All Gemini API keys are fully exhausted for the day.");
 }
-// =================================
 
 const express = require("express");
 const axios = require("axios");
@@ -57,7 +59,6 @@ const crypto = require("crypto");
 const Database = require("better-sqlite3");
 const path = require("path");
 const fs = require("fs");
-require("dotenv").config();
 
 const app = express();
 app.use(
