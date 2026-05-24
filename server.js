@@ -38,17 +38,25 @@ async function processWhatsAppOrder(incomingMessage) {
         model: "gemini-2.5-flash",
         contents: incomingMessage,
         config: {
-          systemInstruction: `You are an automated store assistant for Karibu Fair Price. 
-    Your strict inventory data is: ${JSON.stringify(inventory)}. 
+          // Force the model to output valid JSON
+          responseMimeType: "application/json",
+          systemInstruction: `You are an order extractor and chat assistant for Karibu Fair Price. 
+    Analyze the message against this inventory: ${JSON.stringify(inventory)}.
     
-    CRITICAL RULES:
-    1. Check if the requested items are in the inventory data provided.
-    2. Keep your entire reply short and concise (MAXIMUM 2 to 3 sentences). 
-    3. Do not freestyle long conversational follow-up questions.`,
+    You must respond strictly with a JSON object matching this structure:
+    {
+      "reply": "Your concise 2-3 sentence customer response here checking inventory.",
+      "product_requested": "The specific item name from inventory if matched, otherwise extract the raw item",
+      "order_quantity": "The quantity requested (e.g., 2 packets, 2 loaves)",
+      "delivery_address": "The extracted delivery location"
+    }`,
         },
       });
 
-      return response.text; // Success!
+      // Parse the JSON result from Gemini
+      const result = JSON.parse(response.text);
+
+      return result; // Returns the parsed JSON object
     } catch (error) {
       const status = error.status || (error.response && error.response.status);
       console.warn(
@@ -428,38 +436,31 @@ app.post("/webhook", async (req, res) => {
       console.log("📑 Loaded shop_1.txt catalog.");
     }
 
-    // 1. Forwarding to n8n
-    console.log("🚀 Forwarding payload context to n8n operations core...");
-    try {
-      axios
-        .post(`http://127.0.0.1:5678/webhook-test/deliv-order`, {
-          customer_phone: phoneNumber,
-          raw_message: customerMessage,
-          chat_history: chatHistoryContext,
-          tenant_id: "shop_1",
-        })
-        .catch((err) => console.log("n8n sync complete."));
-    } catch (n8nError) {
-      console.error(
-        "⚠️ Failed to mirror pipeline payload to n8n:",
-        n8nError.message,
-      );
-    }
-
     // 2. Querying Gemini with automatic API key rotation on 429 (quota) errors
     console.log(`🧠 Querying Production Gemini Endpoint...`);
 
     const fullSystemPrompt = `INSTRUCTIONS:\n${shopRules}\n\n${chatHistoryContext}NEW CUSTOMER MESSAGE: "${customerMessage}"`;
 
-    let botResponse = await processWhatsAppOrder(fullSystemPrompt);
+    const result = await processWhatsAppOrder(fullSystemPrompt);
 
     console.log(`🤖 Gemini responded beautifully!`);
 
-    if (typeof saveConversation === "function") {
-      saveConversation(phoneNumber, customerMessage, botResponse);
-    }
+    // 1. Send the clean chat reply back to WhatsApp
+    await sendWhatsAppMessage(phoneNumber, result.reply);
 
-    await sendWhatsAppMessage(phoneNumber, botResponse);
+    // 2. Forward the actual extracted data straight to n8n
+    await axios.post(process.env.N8N_WEBHOOK_URL, {
+      phone: phoneNumber,
+      timestamp: new Date().toISOString(),
+      product_requested: result.product_requested,
+      order_quantity: result.order_quantity,
+      delivery_address: result.delivery_address,
+      shop_tenant: "karibu_fair_price",
+    });
+
+    if (typeof saveConversation === "function") {
+      saveConversation(phoneNumber, customerMessage, result.reply);
+    }
   } catch (error) {
     console.error("⚠️ Primary AI Engine Route Failed.");
     if (error.response?.data) {
