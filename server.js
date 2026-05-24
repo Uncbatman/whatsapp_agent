@@ -1,5 +1,6 @@
 const { GoogleGenAI } = require("@google/genai");
 require("dotenv").config();
+const inventory = require("./inventory.js");
 
 // 1. Properly initialize your array from the environment variables
 const apiKeys = [
@@ -36,6 +37,15 @@ async function processWhatsAppOrder(incomingMessage) {
       const response = await ai.models.generateContent({
         model: "gemini-2.5-flash",
         contents: incomingMessage,
+        config: {
+          systemInstruction: `You are an automated store assistant for Karibu Fair Price. 
+    Your strict inventory data is: ${JSON.stringify(inventory)}. 
+    
+    CRITICAL RULES:
+    1. Check if the requested items are in the inventory data provided.
+    2. Keep your entire reply short and concise (MAXIMUM 2 to 3 sentences). 
+    3. Do not freestyle long conversational follow-up questions.`,
+        },
       });
 
       return response.text; // Success!
