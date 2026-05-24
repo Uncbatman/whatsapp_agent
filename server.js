@@ -1,7 +1,8 @@
 const { GoogleGenAI } = require("@google/genai");
+const { JWT } = require("google-auth-library");
 require("dotenv").config();
 const inventory = require("./inventory.js");
-
+const keysJson = require("./google-credentials.json");
 // 1. Properly initialize your array from the environment variables
 const apiKeys = [
   process.env.GEMINI_API_KEY_1,
@@ -16,21 +17,32 @@ console.log(
 
 let currentKeyIndex = 0;
 
-async function processWhatsAppOrder(incomingMessage) {
-  // 🛡️ Safety check: If the array is literally empty, jump out safely
-  if (apiKeys.length === 0) {
-    throw new Error("No API keys found in your environment configuration.");
-  }
+// 🔑 Google Sheets Direct Authentication Setup
+const googleAuth = new JWT({
+  email: keysJson.client_email,
+  key: keysJson.private_key,
+  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+});
 
+function calculateDeliveryFee(address) {
+  const lowerAddress = address.toLowerCase();
+  const closeLocations = [
+    "gichagi",
+    "terry plaza",
+    "opposite terry plaza",
+    "black gate",
+  ];
+  const isClose = closeLocations.some((loc) => lowerAddress.includes(loc));
+  return isClose
+    ? inventory.delivery_rates.within_1km
+    : inventory.delivery_rates.outside_1km;
+}
+
+async function processWhatsAppOrder(incomingMessage, phone) {
   let retries = apiKeys.length;
 
   while (retries > 0) {
     try {
-      // 🟢 THIS LOG MUST SHOW UP NOW
-      console.log(
-        `🧠 Attempting AI parse with Key Index [${currentKeyIndex}]...`,
-      );
-
       const currentKey = apiKeys[currentKeyIndex];
       const ai = new GoogleGenAI({ apiKey: currentKey });
 
@@ -38,42 +50,73 @@ async function processWhatsAppOrder(incomingMessage) {
         model: "gemini-2.5-flash",
         contents: incomingMessage,
         config: {
-          // Force the model to output valid JSON
           responseMimeType: "application/json",
-          systemInstruction: `You are an order extractor and chat assistant for Karibu Fair Price. 
-    Analyze the message against this inventory: ${JSON.stringify(inventory)}.
-    
-    You must respond strictly with a JSON object matching this structure:
-    {
-      "reply": "Your concise 2-3 sentence customer response here checking inventory.",
-      "product_requested": "The specific item name from inventory if matched, otherwise extract the raw item",
-      "order_quantity": "The quantity requested (e.g., 2 packets, 2 loaves)",
-      "delivery_address": "The extracted delivery location"
-    }`,
+          systemInstruction: `You are an order parser for Karibu Fair Price. 
+          Analyze the message against available inventory keys: ${Object.keys(inventory.products).join(", ")}.
+          Extract the order data strictly into this JSON structure:
+          {
+            "items": [
+              { "name": "matched item name", "quantity": 2 }
+            ],
+            "extracted_address": "extracted delivery address or location name if mentioned, otherwise leave empty"
+          }`,
         },
       });
 
-      // Parse the JSON result from Gemini
-      const result = JSON.parse(response.text);
+      const parsedOrder = JSON.parse(response.text);
 
-      return result; // Returns the parsed JSON object
-    } catch (error) {
-      const status = error.status || (error.response && error.response.status);
-      console.warn(
-        `❌ Key Index [${currentKeyIndex}] failed (Status: ${status || "Error"}). Rotating keys...`,
+      // 💰 Price Calculations
+      let itemsTotalPrice = 0;
+      parsedOrder.items.forEach((item) => {
+        const productInfo = inventory.products[item.name.toLowerCase()];
+        if (productInfo) itemsTotalPrice += productInfo.price * item.quantity;
+      });
+
+      const address = parsedOrder.extracted_address || "Not Specified";
+      const deliveryFee = calculateDeliveryFee(address);
+      const totalAmount = itemsTotalPrice + deliveryFee;
+
+      const replyMessage = `Thank you for your order! Your items come to Ksh ${itemsTotalPrice}, and delivery to ${address} is Ksh ${deliveryFee}, making your total Ksh ${totalAmount}. We are preparing your order for dispatch now!`;
+
+      // 1. Send customer WhatsApp response
+      await sendWhatsAppMessage(phone, replyMessage);
+
+      // 2. 🚀 DIRECT GOOGLE SHEETS APPEND (Bypassing n8n entirely)
+      const spreadsheetId = "1Q9Q-OWZc0aZa-BqVlNyg5aPutitoYs1suKabicQAw-k/";
+      const range = "Sheet1!A:I";
+
+      const rowValues = [
+        phone,
+        new Date().toISOString(),
+        parsedOrder.items.map((i) => `${i.quantity}x ${i.name}`).join(", "),
+        parsedOrder.items.reduce((acc, i) => acc + i.quantity, 0).toString(),
+        address,
+        `Ksh ${itemsTotalPrice}`,
+        `Ksh ${deliveryFee}`,
+        `Ksh ${totalAmount}`,
+        "karibu_fair_price",
+      ];
+
+      // Get an active access token from Google Auth
+      const tokenHeaders = await googleAuth.getRequestHeaders();
+
+      console.log("📊 Appending order data directly to Google Sheets...");
+      await axios.post(
+        `https://sheets.googleapis.com/v1/spreadsheets/${spreadsheetId}/values/${range}:append?valueInputOption=USER_ENTERED`,
+        { values: [rowValues] },
+        { headers: tokenHeaders },
       );
 
-      // Move index pointer to the next slot safely
+      console.log("✅ Row added successfully!");
+      return replyMessage;
+    } catch (error) {
+      console.error("⚠️ Error in engine step:", error.message);
       currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
       retries--;
-
-      // Give it a 1-second pause to breathe before retrying
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
-
-  // This line ONLY fires if it runs out of retries across ALL active keys
-  throw new Error("All Gemini API keys are fully exhausted for the day.");
+  throw new Error("All keys exhausted.");
 }
 
 const express = require("express");
@@ -441,25 +484,13 @@ app.post("/webhook", async (req, res) => {
 
     const fullSystemPrompt = `INSTRUCTIONS:\n${shopRules}\n\n${chatHistoryContext}NEW CUSTOMER MESSAGE: "${customerMessage}"`;
 
-    const result = await processWhatsAppOrder(fullSystemPrompt);
+    const result = await processWhatsAppOrder(fullSystemPrompt, phoneNumber);
 
     console.log(`🤖 Gemini responded beautifully!`);
 
-    // 1. Send the clean chat reply back to WhatsApp
-    await sendWhatsAppMessage(phoneNumber, result.reply);
-
-    // 2. Forward the actual extracted data straight to n8n
-    await axios.post(process.env.N8N_WEBHOOK_URL, {
-      phone: phoneNumber,
-      timestamp: new Date().toISOString(),
-      product_requested: result.product_requested,
-      order_quantity: result.order_quantity,
-      delivery_address: result.delivery_address,
-      shop_tenant: "karibu_fair_price",
-    });
-
+    // Save conversation
     if (typeof saveConversation === "function") {
-      saveConversation(phoneNumber, customerMessage, result.reply);
+      saveConversation(phoneNumber, customerMessage, result);
     }
   } catch (error) {
     console.error("⚠️ Primary AI Engine Route Failed.");
