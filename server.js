@@ -8,6 +8,11 @@ const apiKeys = [
   process.env.GEMINI_API_KEY_3,
 ].filter(Boolean); // This automatically strips out any undefined or empty slots
 
+// 🔍 Diagnostic Boot Log
+console.log(
+  `🔑 System verified: Loaded [${apiKeys.length}] active Gemini keys into rotation pool.`,
+);
+
 let currentKeyIndex = 0;
 
 async function processWhatsAppOrder(incomingMessage) {
