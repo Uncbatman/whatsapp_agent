@@ -1,5 +1,5 @@
 const { GoogleGenAI } = require("@google/genai");
-const { GoogleAuth } = require("google-auth-library");
+const { google } = require("googleapis");
 require("dotenv").config();
 const inventory = require("./inventory.js");
 // 1. Properly initialize your array from the environment variables
@@ -15,13 +15,6 @@ console.log(
 );
 
 let currentKeyIndex = 0;
-
-// 🔑 Google Sheets Direct Authentication Setup
-const googleAuth = new GoogleAuth({
-  keyFile: "./google-credentials.json", // Your credentials file path
-  // ───► Full spreadsheets access
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-});
 
 function calculateDeliveryFee(address) {
   if (!address || address === "Not Specified" || address === "Self-Pickup")
@@ -507,43 +500,53 @@ async function queryGeminiEndpoint(incomingMessage) {
   throw new Error("All Gemini keys exhausted for order parsing.");
 }
 
-/**
- * Append order data to the tenant's Google Sheet
- * @param {string} spreadsheetId - The tenant's specific spreadsheet ID
- * @param {Object} orderData - { date, store, customer, total, mpesa }
- */
 async function appendOrderToGoogleSheets(spreadsheetId, orderData) {
   try {
-    const range = "Sheet1!A:E";
-    const targetUrl = `https://sheets.googleapis.com/v1/spreadsheets/${spreadsheetId}/values/${range}:append?valueInputOption=USER_ENTERED`;
-
-    const tokenHeaders = await googleAuth.getRequestHeaders();
-
-    await axios.post(
-      targetUrl,
-      {
-        range: range,
-        majorDimension: "ROWS",
-        values: [
-          [
-            orderData.date,
-            orderData.store,
-            orderData.customer,
-            `Ksh ${orderData.total}`,
-            orderData.mpesa,
-          ],
-        ],
-      },
-      {
-        headers: {
-          ...tokenHeaders,
-          "Content-Type": "application/json",
-        },
-      },
+    // 🔐 Authenticate dynamically using your Railway environment variable
+    const googleCredentials = JSON.parse(
+      process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON,
     );
-    console.log(`✅ Order logged to sheet [${orderData.store}]`);
-  } catch (sheetError) {
-    console.error("❌ Google Sheets append failed:", sheetError.message);
+
+    const auth = new google.auth.GoogleAuth({
+      credentials: {
+        client_email: googleCredentials.client_email,
+        private_key: googleCredentials.private_key,
+      },
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    });
+
+    const sheets = google.sheets({ version: "v4", auth });
+
+    // 📊 Structure your columns to match your dashboard layout
+    const rowValues = [
+      [
+        orderData.date,
+        orderData.shortCode,
+        orderData.store,
+        orderData.customer,
+        orderData.items,
+        `Ksh ${orderData.subtotal}`,
+        `Ksh ${orderData.delivery}`,
+        `Ksh ${orderData.total}`,
+        orderData.mpesa,
+        orderData.type,
+        "PENDING_RIDER", // Default delivery status column
+      ],
+    ];
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: spreadsheetId,
+      range: "Sheet1!A:K", // Assumes your sheet tab is named Sheet1
+      valueInputOption: "USER_ENTERED",
+      resource: { values: rowValues },
+    });
+
+    console.log(
+      `📊 Successfully logged transaction to Sheet ID: ${spreadsheetId}`,
+    );
+  } catch (error) {
+    console.error("❌ Google Sheets Logging Error:", error.message);
+    throw error; // Propagate up to catch block in your router
   }
 }
 
@@ -700,6 +703,23 @@ app.post("/webhook", async (req, res) => {
         tenant.ownerPhone,
         `📦 *READY FOR PICKUP*\nCustomer: ${senderPhone}\nCode: ${mpesaCode}`,
       );
+
+      // 📊 Log the pickup to the tenant's Google Sheet
+      await appendOrderToGoogleSheets(tenant.spreadsheetId, {
+        date: new Date().toLocaleDateString("en-KE", {
+          timeZone: "Africa/Nairobi",
+        }),
+        shortCode: currentOrder.shortCode,
+        store: tenant.name,
+        customer: senderPhone,
+        items: currentOrder.items,
+        subtotal: currentOrder.subtotal,
+        delivery: 0,
+        total: currentOrder.subtotal,
+        mpesa: mpesaCode,
+        type: "PICKUP",
+      });
+
       delete activeOrders[senderPhone];
     } else if (upperMsg.startsWith("DELIVERY")) {
       const rawDetails = incomingMessage.replace(/DELIVERY/i, "").trim();
@@ -719,15 +739,20 @@ app.post("/webhook", async (req, res) => {
       const riderTicket = `🏍️ *DISPATCH TICKET*\n🏪 Store: ${tenant.name}\n📦 Items: ${currentOrder.items}\n📍 Dropoff: ${location}\n📱 Tel: ${senderPhone}\n🔑 M-Pesa: ${mpesaCode}`;
       await sendWhatsAppMessage(tenant.riderPhone, riderTicket);
 
-      // 📊 Log to the tenant's Google Sheet
+      // 📊 Log the delivery to the tenant's Google Sheet
       await appendOrderToGoogleSheets(tenant.spreadsheetId, {
         date: new Date().toLocaleDateString("en-KE", {
           timeZone: "Africa/Nairobi",
         }),
+        shortCode: currentOrder.shortCode,
         store: tenant.name,
         customer: senderPhone,
+        items: currentOrder.items,
+        subtotal: currentOrder.subtotal,
+        delivery: deliveryFee,
         total: totalToPay,
         mpesa: mpesaCode,
+        type: "DELIVERY",
       });
 
       // Free up memory space for the next round of customers
