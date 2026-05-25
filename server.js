@@ -47,24 +47,7 @@ async function processWhatsAppOrder(incomingMessage, phone) {
         contents: incomingMessage,
         config: {
           responseMimeType: "application/json",
-          systemInstruction: `You are an order manager for Karibu Fair Price.
-          Available stock keys: ${Object.keys(inventory.products).join(", ")}.
-          
-          Your task:
-          1. Evaluate what items the user is asking for.
-          2. If an item matches or closely relates to an available stock key, put it in the "items" array.
-          3. CRITICAL: If the customer asks for items that are NOT in the available stock list (e.g., salt, sunlight), add their original names to the "unavailable_items" array. Do not ignore them.
-          4. Check the location context to set "order_status" ("processing", "pickup", or "needs_location").
-
-          Extract data strictly into this structure:
-          {
-            "items": [
-              { "name": "matched item name", "quantity": 1 }
-            ],
-            "unavailable_items": ["item name 1", "item name 2"],
-            "extracted_address": "address text or leave empty",
-            "order_status": "processing" | "pickup" | "needs_location"
-          }`,
+          systemInstruction: `${FMCG_SYSTEM_PROMPT}\n\nAvailable stock keys: ${Object.keys(inventory.products).join(", ")}.\n\nAdditionally, if a customer asks for items NOT in available stock (e.g., salt, sunlight), add their original names to an "unavailable_items" array. Check location context and set "order_status" ("processing", "pickup", or "needs_location"). Extract "extracted_address" if present. Use this extended structure:\n{\n  "items": [{ "name": "matched item name", "quantity": 1 }],\n  "unavailable_items": ["item name 1"],\n  "extracted_address": "address text",\n  "order_status": "processing" | "pickup" | "needs_location"\n}`,
         },
       });
 
@@ -93,9 +76,9 @@ async function processWhatsAppOrder(incomingMessage, phone) {
       }
 
       // 📦 1. GLOBAL SCOPE CONFIGURATION (Put this BEFORE your "if" routers)
-      const spreadsheetId = "1vifZdUbTvNnpyJ4bJZKAtxcQnLErY9WjevAAIc691dc";
+      const spreadsheetId = "1Q9Q-OWZc0aZa-BqVlNyg5aPutitoYs1suKabicQAw-k";
       const range = "Sheet1!A:I";
-      const targetUrl = `https://sheets.googleapis.com/v1/spreadsheets/${spreadsheetId}/values/Sheet1!A:I:append?valueInputOption=USER_ENTERED`;
+      const targetUrl = `https://sheets.googleapis.com/v1/spreadsheets/${spreadsheetId}/values/${range}:append?valueInputOption=USER_ENTERED`;
 
       // 🗺️ 3. DYNAMIC LOCATION ROUTER
       let replyMessage = "";
@@ -135,8 +118,17 @@ async function processWhatsAppOrder(incomingMessage, phone) {
           // This will now find targetUrl perfectly!
           await axios.post(
             targetUrl,
-            { majorDimension: "ROWS", values: [rowValues] },
-            { headers: tokenHeaders },
+            {
+              range: range,
+              majorDimension: "ROWS",
+              values: [rowValues],
+            },
+            {
+              headers: {
+                ...tokenHeaders,
+                "Content-Type": "application/json",
+              },
+            },
           );
           console.log("✅ Row added successfully to Sheets!");
         } catch (sheetError) {
@@ -458,159 +450,336 @@ async function sendWhatsAppMessage(phoneNumber, messageText) {
 }
 
 // ============================================================================
-// WEBHOOK: Main Message Handler
+// STATEFUL ORDER MANAGEMENT HELPERS
+// ============================================================================
+
+/**
+ * Calculate total price for a list of order items
+ * @param {Array} items - Array of {name, quantity} objects
+ * @returns {number} Total subtotal in Ksh
+ */
+function calculateItemsPrice(items) {
+  let total = 0;
+  for (const item of items) {
+    const name = item.name ? item.name.toLowerCase() : "unknown";
+    const qty = parseInt(item.quantity) || 1;
+    const productInfo = inventory.products[name];
+    if (productInfo) {
+      total += productInfo.price * qty;
+    }
+  }
+  return total;
+}
+
+/**
+ * Parse a customer's order message using Gemini AI
+ * Returns structured order data (items, unavailable items, address, status)
+ * @param {string} incomingMessage - Raw customer message text
+ * @returns {Promise<Object>} Parsed order JSON object
+ */
+async function queryGeminiEndpoint(incomingMessage) {
+  let retries = apiKeys.length;
+
+  while (retries > 0) {
+    try {
+      const currentKey = apiKeys[currentKeyIndex];
+      const ai = new GoogleGenAI({ apiKey: currentKey });
+
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: incomingMessage,
+        config: {
+          responseMimeType: "application/json",
+          systemInstruction: `${FMCG_SYSTEM_PROMPT}\n\nAvailable stock keys: ${Object.keys(inventory.products).join(", ")}.\n\nAdditionally, if a customer asks for items NOT in available stock (e.g., salt, sunlight), add their original names to an "unavailable_items" array. Check location context and set "order_status" ("processing", "pickup", or "needs_location"). Extract "extracted_address" if present. Use this extended structure:\n{\n  "items": [{ "name": "matched item name", "quantity": 1 }],\n  "unavailable_items": ["item name 1"],\n  "extracted_address": "address text",\n  "order_status": "processing" | "pickup" | "needs_location"\n}`,
+        },
+      });
+
+      const parsedOrder = JSON.parse(response.text);
+      return parsedOrder;
+    } catch (error) {
+      console.error("⚠️ Gemini parsing error:", error.message);
+      currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
+      retries--;
+      if (retries > 0)
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+  throw new Error("All Gemini keys exhausted for order parsing.");
+}
+
+/**
+ * Append order data to the tenant's Google Sheet
+ * @param {string} spreadsheetId - The tenant's specific spreadsheet ID
+ * @param {Object} orderData - { date, store, customer, total, mpesa }
+ */
+async function appendOrderToGoogleSheets(spreadsheetId, orderData) {
+  try {
+    const range = "Sheet1!A:E";
+    const targetUrl = `https://sheets.googleapis.com/v1/spreadsheets/${spreadsheetId}/values/${range}:append?valueInputOption=USER_ENTERED`;
+
+    const tokenHeaders = await googleAuth.getRequestHeaders();
+
+    await axios.post(
+      targetUrl,
+      {
+        range: range,
+        majorDimension: "ROWS",
+        values: [
+          [
+            orderData.date,
+            orderData.store,
+            orderData.customer,
+            `Ksh ${orderData.total}`,
+            orderData.mpesa,
+          ],
+        ],
+      },
+      {
+        headers: {
+          ...tokenHeaders,
+          "Content-Type": "application/json",
+        },
+      },
+    );
+    console.log(`✅ Order logged to sheet [${orderData.store}]`);
+  } catch (sheetError) {
+    console.error("❌ Google Sheets append failed:", sheetError.message);
+  }
+}
+
+// 📱 1. STAKEHOLDER REGISTRY
+const shopTenants = {
+  karibu_fair_price: {
+    name: "Karibu Fair Price",
+    tillNumber: "5544321",
+    ownerPhone: "254792305846",
+    riderPhone: "254792120237",
+    // 📊 Share this specific sheet link ONLY with the Karibu owner
+    spreadsheetId: "1pX_KaribuFairPriceSpreadsheetIdHere",
+  },
+  mama_mboga_shop: {
+    name: "Mama Mboga",
+    tillNumber: "6677889",
+    ownerPhone: "254700000000",
+    riderPhone: "254792120237",
+    // 📊 Share this specific sheet link ONLY with Mama Mboga
+    spreadsheetId: "1zY_MamaMbogaSpreadsheetIdHere",
+  },
+};
+
+// 🌍 GLOBAL TRANSLATION & PARSING DICTIONARY
+const FMCG_SYSTEM_PROMPT = `
+You are an expert FMCG inventory parsing agent for Kenyan retail kiosks. 
+Your job is to read unstructured customer text messages and extract items into a clean JSON array.
+
+CRITICAL: Customers will frequently mix English, Swahili, and Sheng. You must interpret and map local terms to their standard product groups:
+- "Unga", "Unga ya ugali", "Jogoo", "Maize flour" -> Maize Flour
+- "Unga ya ngano", "Exe", "Wheat flour" -> Wheat Flour
+- "Maziwa", "Packet maziwa", "Milk" -> Milk
+- "Mkate", "Bread" -> Bread
+- "Mayai", "Eggs" -> Eggs
+- "Sukari", "Sugar" -> Sugar
+
+Return ONLY a valid JSON array matching this exact structure:
+{
+  "items": [
+    { "name": "Maize Flour", "quantity": 1 },
+    { "name": "Milk", "quantity": 1 }
+  ]
+}
+`;
+
+// 🧠 In-memory tracking for active customer checkout sessions
+const activeOrders = {};
+let orderIdCounter = 1; // Simple counter for shortcodes
+
+// ============================================================================
+// WEBHOOK: Main Message Handler (State Machine)
 // ============================================================================
 
 app.post("/webhook", async (req, res) => {
-  // 1. Instantly acknowledge Meta's message to prevent retry storms
-  res.sendStatus(200);
+  // 🔍 THE DIAGNOSTIC SPY: Log raw payload before any processing
+  console.log("📥 RAW INCOMING PAYLOAD:", JSON.stringify(req.body, null, 2));
 
-  let phoneNumber = "";
-  let customerMessage = "";
+  const messageData = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+  const incomingMessage = (messageData?.text?.body || "").trim();
+  const senderPhone = messageData?.from;
 
-  try {
-    const entry = req.body?.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const messageObject = changes?.value?.messages?.[0];
+  if (!incomingMessage || !senderPhone) return res.sendStatus(200);
 
-    if (!messageObject || !messageObject.text?.body) return;
+  const tenantKey = "karibu_fair_price";
+  const tenant = shopTenants[tenantKey];
+  const upperMsg = incomingMessage.toUpperCase();
 
-    phoneNumber = messageObject.from;
-    customerMessage = messageObject.text.body.trim();
+  // ────────────────────────────────────────────────────────
+  // ACTION A: THE SHOP OWNER APPROVAL GATEWAY (Short-Code Version)
+  // ────────────────────────────────────────────────────────
+  if (
+    senderPhone === tenant.ownerPhone &&
+    (upperMsg.startsWith("ACCEPT") || upperMsg.startsWith("REJECT"))
+  ) {
+    const parts = incomingMessage.split(" ");
+    const action = parts[0].toUpperCase();
+    const targetShortCode = parts[1]; // This will be "1", "2", "3", etc.
 
-    console.log(`\n📨 Live Message from ${phoneNumber}: "${customerMessage}"`);
+    if (!targetShortCode) {
+      await sendWhatsAppMessage(
+        tenant.ownerPhone,
+        "⚠️ Please specify the order number. Example: *ACCEPT 1*",
+      );
+      return res.sendStatus(200);
+    }
 
-    // Memory Context Pulling
-    let chatHistoryContext = "";
-    try {
-      const historyRows = db
-        .prepare(
-          `
-        SELECT customer_message, bot_response 
-        FROM conversations 
-        WHERE customer_phone = ? 
-        ORDER BY timestamp DESC 
-        LIMIT 4
-      `,
-        )
-        .all(phoneNumber);
-
-      if (historyRows && historyRows.length > 0) {
-        chatHistoryContext = "RECENT CONVERSATION HISTORY:\n";
-        historyRows.reverse().forEach((row) => {
-          chatHistoryContext += `Customer: ${row.customer_message}\nAssistant: ${row.bot_response}\n`;
-        });
-        chatHistoryContext += "\n";
-        console.log(
-          `📜 Loaded ${historyRows.length} recent messages for memory context.`,
-        );
+    // Find the customer phone number linked to that specific short-code ID
+    let customerPhone = null;
+    for (const [phone, order] of Object.entries(activeOrders)) {
+      if (
+        order.shortCode === targetShortCode &&
+        order.status === "PENDING_OWNER_APPROVAL"
+      ) {
+        customerPhone = phone;
+        break;
       }
-    } catch (dbError) {
-      console.error("⚠️ Error pulling chat history:", dbError.message);
     }
 
-    // Load Multi-tenant shop catalog
-    const catalogPath = path.resolve(__dirname, "catalogs", "shop_1.txt");
-    let shopRules = "You are a polite shop assistant for Karibu Fair Price.";
-    if (fs.existsSync(catalogPath)) {
-      shopRules = fs.readFileSync(catalogPath, "utf8");
-      console.log("📑 Loaded shop_1.txt catalog.");
+    const order = activeOrders[customerPhone];
+
+    if (!order) {
+      await sendWhatsAppMessage(
+        tenant.ownerPhone,
+        `❌ Error: Order #${targetShortCode} not found or already processed.`,
+      );
+      return res.sendStatus(200);
     }
 
-    // 2. Querying Gemini with automatic API key rotation on 429 (quota) errors
-    console.log(`🧠 Querying Production Gemini Endpoint...`);
+    if (action === "ACCEPT") {
+      order.status = "AWAITING_CUSTOMER_FINALIZATION";
 
-    const fullSystemPrompt = `INSTRUCTIONS:\n${shopRules}\n\n${chatHistoryContext}NEW CUSTOMER MESSAGE: "${customerMessage}"`;
+      const promptMessage =
+        `Your order is approved! Please pay Ksh ${order.subtotal} to Till *${tenant.tillNumber}*.\n` +
+        `Reply *PICKUP [MpesaCode]* or *DELIVERY [Location] [MpesaCode]* to finalize.`;
 
-    const result = await processWhatsAppOrder(fullSystemPrompt, phoneNumber);
-
-    console.log(`🤖 Gemini responded beautifully!`);
-
-    // Save conversation
-    if (typeof saveConversation === "function") {
-      saveConversation(phoneNumber, customerMessage, result);
-    }
-  } catch (error) {
-    console.error("⚠️ Primary AI Engine Route Failed.");
-    if (error.response?.data) {
-      console.error(
-        "🔴 Raw Error from Google Server:",
-        JSON.stringify(error.response.data, null, 2),
+      await sendWhatsAppMessage(customerPhone, promptMessage);
+      await sendWhatsAppMessage(
+        tenant.ownerPhone,
+        `✅ Approved order #${targetShortCode}. Prompt sent to customer.`,
       );
     } else {
-      console.error("🔴 Connection Message:", error.message);
-    }
-
-    console.log("🔄 Launching contextual local backup keyword matcher...");
-
-    if (!customerMessage || !phoneNumber) return;
-
-    let fallbackResponse = "";
-    const lowerMsg = customerMessage.toLowerCase();
-    let activeProduct = "";
-
-    if (
-      lowerMsg.includes("rice") ||
-      lowerMsg.includes("mchele") ||
-      lowerMsg.includes("pishori")
-    )
-      activeProduct = "rice";
-    else if (lowerMsg.includes("sugar") || lowerMsg.includes("sukari"))
-      activeProduct = "sugar";
-    else if (lowerMsg.includes("oil") || lowerMsg.includes("mafuta"))
-      activeProduct = "oil";
-
-    if (!activeProduct) {
-      try {
-        const lastRow = db
-          .prepare(
-            "SELECT customer_message, bot_response FROM conversations WHERE customer_phone = ? ORDER BY timestamp DESC LIMIT 1",
-          )
-          .get(phoneNumber);
-        if (lastRow) {
-          const combined = (
-            lastRow.customer_message +
-            " " +
-            lastRow.bot_response
-          ).toLowerCase();
-          if (combined.includes("rice") || combined.includes("pishori"))
-            activeProduct = "rice";
-          else if (combined.includes("sugar") || combined.includes("sukari"))
-            activeProduct = "sugar";
-          else if (combined.includes("oil") || combined.includes("mafuta"))
-            activeProduct = "oil";
-        }
-      } catch (dbe) {}
-    }
-
-    if (activeProduct === "rice") {
-      fallbackResponse =
-        "🌾 *Karibu Fair Price Rice*:\n• Pishori 1kg: KES 240 | 1/2kg: KES 120\n• Sindano 1kg: KES 180\nReply with your exact quantity and estate street name to complete your order!";
-    } else if (activeProduct === "sugar") {
-      fallbackResponse =
-        "🍬 *Kabras Sugar Prices*:\n• 1kg: KES 210 | 2kg: KES 410\nReply with your exact quantity and estate street name to log your order!";
-    } else if (activeProduct === "oil") {
-      fallbackResponse =
-        "🛢️ *Cooking Oil Prices*:\n• Fresh Fri 1L: KES 320 | 2L: KES 620\nReply with your street name to order!";
-    } else {
-      fallbackResponse =
-        "👋 Karibu Fair Price! We sell fresh Rice, Sugar, Cooking Oil, and Beans. What can I help you find today?";
-    }
-
-    try {
-      if (typeof saveConversation === "function")
-        saveConversation(phoneNumber, customerMessage, fallbackResponse);
-      await sendWhatsAppMessage(phoneNumber, fallbackResponse);
-      console.log(
-        `✅ Handled customer via fallback context [Context: ${activeProduct || "None"}]`,
+      delete activeOrders[customerPhone];
+      await sendWhatsAppMessage(
+        customerPhone,
+        "😔 We are sorry, the shop is currently unable to fulfill your order. It has been cancelled.",
       );
-    } catch (sendError) {
-      console.error(
-        "❌ Deep System Error sending fallback:",
-        sendError.message,
+      await sendWhatsAppMessage(
+        tenant.ownerPhone,
+        `❌ Order #${targetShortCode} has been rejected.`,
       );
     }
+    return res.sendStatus(200);
   }
+
+  // ────────────────────────────────────────────────────────
+  // ACTION B: THE CUSTOMER CHECKOUT LOOP
+  // ────────────────────────────────────────────────────────
+  const currentOrder = activeOrders[senderPhone];
+
+  if (
+    currentOrder &&
+    currentOrder.status === "AWAITING_CUSTOMER_FINALIZATION"
+  ) {
+    if (upperMsg.startsWith("PICKUP")) {
+      const mpesaCode = incomingMessage
+        .replace(/PICKUP/i, "")
+        .trim()
+        .toUpperCase();
+      await sendWhatsAppMessage(
+        senderPhone,
+        `🛍️ Payment received! Your order is being packed for pickup.`,
+      );
+      await sendWhatsAppMessage(
+        tenant.ownerPhone,
+        `📦 *READY FOR PICKUP*\nCustomer: ${senderPhone}\nCode: ${mpesaCode}`,
+      );
+      delete activeOrders[senderPhone];
+    } else if (upperMsg.startsWith("DELIVERY")) {
+      const rawDetails = incomingMessage.replace(/DELIVERY/i, "").trim();
+      const detailsArray = rawDetails.split(" ");
+      const mpesaCode = detailsArray.pop().toUpperCase();
+      const location = detailsArray.join(" ") || "Specified Address";
+
+      // 💵 Flat delivery fee update
+      const deliveryFee = 20;
+      const totalToPay = currentOrder.subtotal + deliveryFee;
+
+      // 🏍️ Sentence 1: Confirmed amount | Sentence 2: Arriving shortly reassurance
+      const customerReceipt = `🏍️ Confirmed! Total paid: Ksh ${totalToPay} (incl. Ksh 20 delivery). Our rider is arriving shortly at ${location}!`;
+      await sendWhatsAppMessage(senderPhone, customerReceipt);
+
+      // Keep the rider ticket structured so they have everything they need on the road
+      const riderTicket = `🏍️ *DISPATCH TICKET*\n🏪 Store: ${tenant.name}\n📦 Items: ${currentOrder.items}\n📍 Dropoff: ${location}\n📱 Tel: ${senderPhone}\n🔑 M-Pesa: ${mpesaCode}`;
+      await sendWhatsAppMessage(tenant.riderPhone, riderTicket);
+
+      // 📊 Log to the tenant's Google Sheet
+      await appendOrderToGoogleSheets(tenant.spreadsheetId, {
+        date: new Date().toLocaleDateString("en-KE", {
+          timeZone: "Africa/Nairobi",
+        }),
+        store: tenant.name,
+        customer: senderPhone,
+        total: totalToPay,
+        mpesa: mpesaCode,
+      });
+
+      // Free up memory space for the next round of customers
+      delete activeOrders[senderPhone];
+    }
+    return res.sendStatus(200);
+  }
+
+  // ────────────────────────────────────────────────────────
+  // ACTION C: PRIMARY INITIAL CUSTOMER INBOUND ORDER
+  // ────────────────────────────────────────────────────────
+  try {
+    const parsedOrder = await queryGeminiEndpoint(incomingMessage);
+    const subtotal = calculateItemsPrice(parsedOrder.items);
+    const formattedItemString = parsedOrder.items
+      .map((i) => `${i.quantity}x ${i.name}`)
+      .join(", ");
+
+    // Assign a unique short-code number to this temporary memory block
+    const assignedId = orderIdCounter.toString();
+    orderIdCounter++; // Increment for the next customer
+
+    activeOrders[senderPhone] = {
+      shortCode: assignedId,
+      status: "PENDING_OWNER_APPROVAL",
+      items: formattedItemString,
+      subtotal: subtotal,
+    };
+
+    // 🔔 Send the owner the alert featuring the tiny ID code
+    const ownerAlert =
+      `🔔 *NEW ORDER #${assignedId} RECEIVED*\n` +
+      `👤 Customer: ${senderPhone}\n` +
+      `📦 Items: ${formattedItemString}\n` +
+      `💵 Est. Subtotal: Ksh ${subtotal}\n\n` +
+      `👉 Reply *ACCEPT ${assignedId}* to approve.\n` +
+      `👉 Reply *REJECT ${assignedId}* to decline.`;
+
+    await sendWhatsAppMessage(tenant.ownerPhone, ownerAlert);
+    await sendWhatsAppMessage(
+      senderPhone,
+      "⏳ Thank you! We are checking shelf availability with the shop manager right now. We'll text you the moment it's confirmed.",
+    );
+  } catch (geminiError) {
+    console.error("❌ Order parsing failed:", geminiError.message);
+    await sendWhatsAppMessage(
+      senderPhone,
+      "Sorry, I had trouble reading your order text. Please list the items clearly!",
+    );
+  }
+
+  return res.sendStatus(200);
 });
 
 // ============================================================================
@@ -766,64 +935,7 @@ app.get("/health", (req, res) => {
 // START SERVER (async init first)
 // ============================================================================
 
-const PORT = Number.isInteger(parseInt(process.env.PORT, 10))
-  ? parseInt(process.env.PORT, 10)
-  : 3000;
-
-initDatabase()
-  .then(() => {
-    const server = app.listen(PORT);
-
-    server.on("listening", () => {
-      console.log(`
-╔═══════════════════════════════════════════════════════════════════════════╗
-║   🤖 FMCG WhatsApp Chatbot Running                         ║
-╚═══════════════════════════════════════════════════════════════════════════╝
-
-🌐 Server: http://localhost:${PORT}
-📱 Webhook (POST): /webhook
-🔐 Webhook (GET): /webhook (verification)
-❤️  Health: /health
-
-📊 ADMIN ENDPOINTS:
-   GET  /admin/conversations           → All conversations
-   GET  /admin/conversations/:phone    → Customer history
-   GET  /admin/inventory              → All products
-   GET  /admin/stats                  → Bot statistics
-   POST /admin/add-product            → Add new product
-
-⚙️  Environment:
-   WHATSAPP_TOKEN: ${process.env.WHATSAPP_TOKEN ? "✅ Set" : "❌ Not set"}
-   BUSINESS_PHONE: ${process.env.BUSINESS_PHONE ? "✅ Set" : "❌ Not set"}
-   VERIFY_TOKEN: ${process.env.VERIFY_TOKEN ? "✅ Set" : "❌ Not set"}
-      `);
-    });
-
-    server.on("error", (err) => {
-      if (err.code === "EADDRINUSE") {
-        console.error(
-          `❌ Port ${PORT} is already in use. Set PORT to a free port or stop the process using it.`,
-        );
-      } else {
-        console.error("❌ Server error:", err);
-      }
-      process.exit(1);
-    });
-
-    process.on("SIGINT", () => {
-      console.log("\n👋 Shutting down gracefully...");
-      const stats = db
-        .prepare("SELECT COUNT(*) as count FROM conversations")
-        .get();
-      const count = stats?.count || 0;
-      console.log(`📊 Final stats: ${count} conversations saved`);
-      db.close();
-      server.close(() => process.exit(0));
-    });
-
-    module.exports = app;
-  })
-  .catch((err) => {
-    console.error("❌ Failed to initialize database:", err);
-    process.exit(1);
-  });
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`🚀 Multi-Tenant Server running on port ${PORT}`);
+});
