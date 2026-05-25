@@ -10,6 +10,6 @@ module.exports = {
   },
   delivery_rates: {
     within_1km: 20,
-    outside_1km: 50, // Backup default if further away
+    outside_2km: 50, // Backup default if further away
   },
 };

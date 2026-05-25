@@ -1,8 +1,7 @@
 const { GoogleGenAI } = require("@google/genai");
-const { JWT } = require("google-auth-library");
+const { GoogleAuth } = require("google-auth-library");
 require("dotenv").config();
 const inventory = require("./inventory.js");
-const keysJson = require("./google-credentials.json");
 // 1. Properly initialize your array from the environment variables
 const apiKeys = [
   process.env.GEMINI_API_KEY_1,
@@ -18,24 +17,21 @@ console.log(
 let currentKeyIndex = 0;
 
 // 🔑 Google Sheets Direct Authentication Setup
-const googleAuth = new JWT({
-  email: keysJson.client_email,
-  key: keysJson.private_key,
+const googleAuth = new GoogleAuth({
+  keyFile: "./google-credentials.json", // Your credentials file path
+  // ───► Full spreadsheets access
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
 
 function calculateDeliveryFee(address) {
-  const lowerAddress = address.toLowerCase();
-  const closeLocations = [
-    "gichagi",
-    "terry plaza",
-    "opposite terry plaza",
-    "black gate",
-  ];
-  const isClose = closeLocations.some((loc) => lowerAddress.includes(loc));
-  return isClose
-    ? inventory.delivery_rates.within_1km
-    : inventory.delivery_rates.outside_1km;
+  if (!address || address === "Not Specified" || address === "Self-Pickup")
+    return 0;
+
+  const cleanAddress = address.toLowerCase();
+  if (cleanAddress.includes("gichagi")) return 20;
+
+  // Default fee for unconfigured estates/locations
+  return 50;
 }
 
 async function processWhatsAppOrder(incomingMessage, phone) {
@@ -51,63 +47,105 @@ async function processWhatsAppOrder(incomingMessage, phone) {
         contents: incomingMessage,
         config: {
           responseMimeType: "application/json",
-          systemInstruction: `You are an order parser for Karibu Fair Price. 
-          Analyze the message against available inventory keys: ${Object.keys(inventory.products).join(", ")}.
-          Extract the order data strictly into this JSON structure:
+          systemInstruction: `You are an order manager for Karibu Fair Price.
+          Available stock keys: ${Object.keys(inventory.products).join(", ")}.
+          
+          Your task:
+          1. Evaluate what items the user is asking for.
+          2. If an item matches or closely relates to an available stock key, put it in the "items" array.
+          3. CRITICAL: If the customer asks for items that are NOT in the available stock list (e.g., salt, sunlight), add their original names to the "unavailable_items" array. Do not ignore them.
+          4. Check the location context to set "order_status" ("processing", "pickup", or "needs_location").
+
+          Extract data strictly into this structure:
           {
             "items": [
-              { "name": "matched item name", "quantity": 2 }
+              { "name": "matched item name", "quantity": 1 }
             ],
-            "extracted_address": "extracted delivery address or location name if mentioned, otherwise leave empty"
+            "unavailable_items": ["item name 1", "item name 2"],
+            "extracted_address": "address text or leave empty",
+            "order_status": "processing" | "pickup" | "needs_location"
           }`,
         },
       });
 
       const parsedOrder = JSON.parse(response.text);
 
-      // 💰 Price Calculations
+      // 📦 1. Parse Available Items & Prices (Your existing calculation logic)
       let itemsTotalPrice = 0;
-      parsedOrder.items.forEach((item) => {
-        const productInfo = inventory.products[item.name.toLowerCase()];
-        if (productInfo) itemsTotalPrice += productInfo.price * item.quantity;
-      });
+      let totalQty = 0;
+      const parsedItems = parsedOrder.items || [];
+      const itemStrings = parsedItems
+        .map((item) => {
+          const name = item.name ? item.name.toLowerCase() : "unknown";
+          const qty = parseInt(item.quantity) || 1;
+          const productInfo = inventory.products[name];
+          if (productInfo) itemsTotalPrice += productInfo.price * qty;
+          totalQty += qty;
+          return `${qty}x ${name}`;
+        })
+        .join(", ");
 
-      const address = parsedOrder.extracted_address || "Not Specified";
-      const deliveryFee = calculateDeliveryFee(address);
-      const totalAmount = itemsTotalPrice + deliveryFee;
+      // 🛑 2. NEW: BUILD THE UNAVAILABLE ITEMS STRING IF THEY EXIST
+      let unavailableNotice = "";
+      const unavailableList = parsedOrder.unavailable_items || [];
+      if (unavailableList.length > 0) {
+        unavailableNotice = `⚠️ Note: We currently don't have [${unavailableList.join(", ")}] in stock today, so we left them out.\n\n`;
+      }
 
-      const replyMessage = `Thank you for your order! Your items come to Ksh ${itemsTotalPrice}, and delivery to ${address} is Ksh ${deliveryFee}, making your total Ksh ${totalAmount}. We are preparing your order for dispatch now!`;
-
-      // 1. Send customer WhatsApp response
-      await sendWhatsAppMessage(phone, replyMessage);
-
-      // 2. 🚀 DIRECT GOOGLE SHEETS APPEND (Bypassing n8n entirely)
-      const spreadsheetId = "1Q9Q-OWZc0aZa-BqVlNyg5aPutitoYs1suKabicQAw-k/";
+      // 📦 1. GLOBAL SCOPE CONFIGURATION (Put this BEFORE your "if" routers)
+      const spreadsheetId = "1vifZdUbTvNnpyJ4bJZKAtxcQnLErY9WjevAAIc691dc";
       const range = "Sheet1!A:I";
+      const targetUrl = `https://sheets.googleapis.com/v1/spreadsheets/${spreadsheetId}/values/Sheet1!A:I:append?valueInputOption=USER_ENTERED`;
 
-      const rowValues = [
-        phone,
-        new Date().toISOString(),
-        parsedOrder.items.map((i) => `${i.quantity}x ${i.name}`).join(", "),
-        parsedOrder.items.reduce((acc, i) => acc + i.quantity, 0).toString(),
-        address,
-        `Ksh ${itemsTotalPrice}`,
-        `Ksh ${deliveryFee}`,
-        `Ksh ${totalAmount}`,
-        "karibu_fair_price",
-      ];
+      // 🗺️ 3. DYNAMIC LOCATION ROUTER
+      let replyMessage = "";
+      let deliveryFee = 0;
+      const address = parsedOrder.extracted_address || "Not Specified";
 
-      // Get an active access token from Google Auth
-      const tokenHeaders = await googleAuth.getRequestHeaders();
+      if (parsedOrder.order_status === "needs_location") {
+        replyMessage = `${unavailableNotice}I've got your order down for ${itemStrings || "the remaining items"} (Subtotal: Ksh ${itemsTotalPrice}). \n\nWould you like this delivered, or will you pick it up at the shop? If delivery, please reply with your specific location or estate name!`;
+      } else if (parsedOrder.order_status === "pickup") {
+        deliveryFee = 0;
+        const totalAmount = itemsTotalPrice + deliveryFee;
+        replyMessage = `${unavailableNotice}Awesome! We're packing your order (${itemStrings}) for collection. Total to pay at the shop is Ksh ${totalAmount}. See you soon!`;
+      } else {
+        deliveryFee = calculateDeliveryFee(address);
+        const totalAmount = itemsTotalPrice + deliveryFee;
+        replyMessage = `${unavailableNotice}Thank you for your order! Your available items come to Ksh ${itemsTotalPrice}, and delivery to ${address} is Ksh ${deliveryFee}, making your total Ksh ${totalAmount}. We are preparing your order for dispatch now!`;
+      }
 
-      console.log("📊 Appending order data directly to Google Sheets...");
-      await axios.post(
-        `https://sheets.googleapis.com/v1/spreadsheets/${spreadsheetId}/values/${range}:append?valueInputOption=USER_ENTERED`,
-        { values: [rowValues] },
-        { headers: tokenHeaders },
-      );
+      // 🛡️ 3. ISOLATED GOOGLE SHEETS APPEND
+      if (parsedOrder.order_status !== "needs_location") {
+        try {
+          const rowValues = [
+            String(phone),
+            new Date().toISOString(),
+            String(itemStrings || "None"),
+            String(totalQty),
+            String(address),
+            `Ksh ${itemsTotalPrice}`,
+            `Ksh ${deliveryFee}`,
+            `Ksh ${itemsTotalPrice + deliveryFee}`,
+            "karibu_fair_price",
+          ];
 
-      console.log("✅ Row added successfully!");
+          const tokenHeaders = await googleAuth.getRequestHeaders();
+          console.log("📊 Appending order data directly to Google Sheets...");
+
+          // This will now find targetUrl perfectly!
+          await axios.post(
+            targetUrl,
+            { majorDimension: "ROWS", values: [rowValues] },
+            { headers: tokenHeaders },
+          );
+          console.log("✅ Row added successfully to Sheets!");
+        } catch (sheetError) {
+          console.error("❌ Google Sheets Logging Failed:", sheetError.message);
+        }
+      }
+
+      // 3. 📱 SEND WHATSAPP MESSAGE
+      await sendWhatsAppMessage(phone, replyMessage);
       return replyMessage;
     } catch (error) {
       console.error("⚠️ Error in engine step:", error.message);
