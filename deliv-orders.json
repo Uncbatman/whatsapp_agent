@@ -1,0 +1,178 @@
+{
+  "name": "deliv-orders",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "deliv-order",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "da679966-22d3-4ee0-b78b-1e7d5acd3edc",
+      "name": "Webhook",
+      "webhookId": "b0358e5f-9e91-43dd-b819-8147c1f3cfe1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get the incoming webhook payload fields\nconst item = $input.item.json.body;\nconst rawMessage = item.raw_message || \"\";\n\n// Initialize clean structural variables\nlet product = \"Unknown\";\nlet quantity = \"Not Specified\";\nlet location = \"Store Pickup / Not Provided\";\n\nconst lowerText = rawMessage.toLowerCase();\n\n// Light structural processing matching your duka's inventory\nif (lowerText.includes(\"rice\") || lowerText.includes(\"mchele\") || lowerText.includes(\"pishori\")) {\n  product = \"Pishori Rice\";\n} else if (lowerText.includes(\"sugar\") || lowerText.includes(\"sukari\")) {\n  product = \"Kabras Sugar\";\n} else if (lowerText.includes(\"oil\") || lowerText.includes(\"mafuta\")) {\n  product = \"Cooking Oil\";\n} else if (lowerText.includes(\"eggs\")) {\n  product = \"Eggs\";\n}\n\n// Regex to look for common quantity layouts (e.g., 1kg, 2kg, 6 eggs, 2 packets)\nconst qtyMatch = rawMessage.match(/(\\d+\\s*(?:kg|g|l|packets|eggs|packet))/i) || rawMessage.match(/(\\d\\/2\\s*kg)/i);\nif (qtyMatch) {\n  quantity = qtyMatch[1];\n}\n\n// Extract location text variations using structural boundaries\nif (lowerText.includes(\"delivered to\")) {\n  location = rawMessage.split(/delivered to/i)[1]?.trim();\n} else if (lowerText.includes(\"deliver to\")) {\n  location = rawMessage.split(/deliver to/i)[1]?.trim();\n}\n\n// Format the final clean row schema for your Google Sheet\nreturn {\n  json: {\n    phone: item.customer_phone,\n    timestamp: new Date().toISOString(),\n    product_requested: product,\n    order_quantity: quantity,\n    delivery_address: location,\n    full_text_backup: rawMessage,\n    shop_tenant: item.tenant_id\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        432,
+        0
+      ],
+      "id": "a45aeb72-a4ed-4e76-87ac-a01e7aa12d7d",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1Q9Q-OWZc0aZa-BqVlNyg5aPutitoYs1suKabicQAw-k",
+          "mode": "list",
+          "cachedResultName": "deliv-orders",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1Q9Q-OWZc0aZa-BqVlNyg5aPutitoYs1suKabicQAw-k/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Sheet1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1Q9Q-OWZc0aZa-BqVlNyg5aPutitoYs1suKabicQAw-k/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        640,
+        0
+      ],
+      "id": "402aded7-fd7c-4403-9e01-6d7fe5f6142e",
+      "name": "Append row in sheet",
+      "credentials": {
+        "googleApi": {
+          "id": "fQGkkmjRiTr4LD5g",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.query[\"hub.challenge\"] }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        208,
+        0
+      ],
+      "id": "d98fe96a-2213-4331-869d-11e37b5be12f",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "phoneNumberId": "=1040339102503628",
+        "recipientPhoneNumber": "={{ $json.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.from?.replace('+', '') || '' }}",
+        "textBody": "Karibu! Your order has been received. Waiting for shop to accept..",
+        "additionalFields": {
+          "previewUrl": false
+        }
+      },
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1.1,
+      "position": [
+        848,
+        0
+      ],
+      "id": "6269f94c-dc1c-4226-8998-19378ec3bd0f",
+      "name": "Send message",
+      "webhookId": "8d4447cd-6a2b-4431-9662-88be301dd414",
+      "credentials": {
+        "whatsAppApi": {
+          "id": "BU441qD0dQWpa94q",
+          "name": "WhatsApp account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Append row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond to Webhook": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append row in sheet": {
+      "main": [
+        [
+          {
+            "node": "Send message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "204f9aae-8ed6-4515-8d9a-a2625d42055f",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "22ead30388efe8e6ddfb8b40e10b1007566726d8848639724a08ec12a31694bd"
+  },
+  "id": "V049iOkYO7O4Ky9f",
+  "tags": []
+}
